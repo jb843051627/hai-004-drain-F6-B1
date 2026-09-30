@@ -228,6 +228,46 @@ CREATE TABLE IF NOT EXISTS t_drain_run_record (
   KEY idx_site_year (site_no, run_year, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='机组运行记录单(一机组一年一单)';
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 老库补键迁移（CREATE TABLE IF NOT EXISTS 对已存在的表不会补唯一键）：
+-- 早期只靠应用层 selectCount 查重，并发两道请求能同时查空、双双落库，库里于是有了
+-- 同号重单；重单又反过来把「编辑老单、单号压根没动」的保存误判成撞号拦回。
+-- 这里先把历史重单清到每组只剩一张（优先留在档 del_flag=0，其次留最小 id），
+-- 再按 information_schema 判断补建唯一键；整段幂等，重复执行不报错、不重复清。
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- 1) 同 bill_no 重单：每组只留一张。空号(NULL)不参与，等号连接天然不匹配 NULL
+DELETE r1 FROM t_drain_run_record r1
+JOIN t_drain_run_record r2 ON r1.bill_no = r2.bill_no
+WHERE r1.id <> r2.id
+  AND ( (COALESCE(r2.del_flag,0) = 0 AND COALESCE(r1.del_flag,0) = 1)
+     OR (COALESCE(r2.del_flag,0) = COALESCE(r1.del_flag,0) AND r2.id < r1.id) );
+
+-- 2) 同 (unit_id, run_year) 重单：<=> 空值安全比较，同样每组只留一张
+DELETE r1 FROM t_drain_run_record r1
+JOIN t_drain_run_record r2
+  ON r1.unit_id <=> r2.unit_id AND r1.run_year <=> r2.run_year
+WHERE r1.id <> r2.id
+  AND ( (COALESCE(r2.del_flag,0) = 0 AND COALESCE(r1.del_flag,0) = 1)
+     OR (COALESCE(r2.del_flag,0) = COALESCE(r1.del_flag,0) AND r2.id < r1.id) );
+
+-- 3) 缺哪个唯一键补哪个（已建则 SELECT 1 空过），此后并发撞单由库键当场退回
+SET @ddl := (SELECT IF(
+  (SELECT COUNT(*) FROM information_schema.statistics
+   WHERE table_schema = DATABASE() AND table_name = 't_drain_run_record'
+     AND index_name = 'uk_bill_no') = 0,
+  'ALTER TABLE t_drain_run_record ADD UNIQUE KEY uk_bill_no (bill_no)',
+  'SELECT 1'));
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @ddl := (SELECT IF(
+  (SELECT COUNT(*) FROM information_schema.statistics
+   WHERE table_schema = DATABASE() AND table_name = 't_drain_run_record'
+     AND index_name = 'uk_unit_year') = 0,
+  'ALTER TABLE t_drain_run_record ADD UNIQUE KEY uk_unit_year (unit_id, run_year)',
+  'SELECT 1'));
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
 CREATE TABLE IF NOT EXISTS t_drain_station (
   id bigint NOT NULL COMMENT '主键',
   site_no varchar(64) DEFAULT NULL COMMENT '泵站编号',

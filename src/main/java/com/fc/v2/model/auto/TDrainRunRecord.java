@@ -32,7 +32,7 @@ public class TDrainRunRecord implements Serializable {
     @ApiModelProperty(value = "主键")
     private Long id;
 
-    /** 运行单号（人手填，未删范围内唯一） */
+    /** 运行单号（人手填，但须照档案标准号 YX-运行年-机组ID，服务层对档案，未删范围内唯一） */
     @TableField("bill_no")
     @ApiModelProperty(value = "运行单号")
     private String billNo;

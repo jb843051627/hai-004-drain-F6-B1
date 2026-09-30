@@ -222,10 +222,12 @@ public class TDrainLevelStdServiceImpl implements ITDrainLevelStdService {
     }
 
     /**
-     * 分档（下发口径：临界取高一档，与档案种子 drain_seed.sql 同口径、base=1）：
-     * 落在 [上一档上限, 本档上限) 取本档，等于本档上限即压线，归高一档；
-     * 为 NULL 的档视作未划线顺次往下着；达到或高出全部已划档归超档(4)。
-     * 与机组运行评定档 gradeOf 同一把尺，两处不许漂移。
+     * 分档（起排判线口径，与 drain_level_seed.sql 同口径、base=1）：
+     * 这是水位警戒判线——落在 [上一档上限, 本档上限) 取本档，等于本档上限即压线，
+     * 警戒到位归高一档；为 NULL 的档视作未划线顺次往下着；达到或高出全部已划档归超档(4)。
+     * 注意：它与机组运行评定档 TDrainRunRecordServiceImpl.gradeOf 是两把尺——
+     * 判线是警戒（压线升级），评定档是考核分档（列名「本档上限」，压线留本档），
+     * 各依各的业务，不许互相「对齐」。
      */
     private int levelOf(TDrainLevelStd rule, BigDecimal input) {
         if (rule.getTh1Max() != null && input.compareTo(rule.getTh1Max()) < 0) {

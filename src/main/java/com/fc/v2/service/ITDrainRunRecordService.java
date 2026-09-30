@@ -27,14 +27,18 @@ public interface ITDrainRunRecordService {
     int insertTDrainRunRecord(TDrainRunRecord record);
 
     /**
-     * 登记唯一业务入口（服务层校验）：单号人手填、一机组一年一单、停用站不收、
+     * 登记唯一业务入口（服务层校验）：单号人手填、但必须照档案标准号 YX-运行年-机组ID
+     * （对不上档案当场退回，手改值不落库）；一机组一年一单；停用站不收；
      * 时长非法当场退回；电耗费照 powerPrice（元/运行小时）由系统核算，
-     * 评定档照档案三档上限由系统折，表单给的这两列一律不信。
+     * 评定档照档案三档上限由系统折（压线归本档），表单给的这两列与创建人一律不信。
      * 返回落库后的记录单（系统算出的费与档以返回为准）。
      */
     TDrainRunRecord registerTDrainRunRecord(TDrainRunRecord record, java.math.BigDecimal powerPrice);
 
-    /** 修改 */
+    /**
+     * 修改老单：只放行时长（费/档随之照档案重算）与备注；单号照档案钉死不许改
+     * （没动原样保存，不再 ne(id) 查重误伤），机组/站/年度/状态/创建人等锚点与系统列不进门。
+     */
     int updateTDrainRunRecord(TDrainRunRecord record);
 
     /** 批量删除 */

@@ -108,6 +108,19 @@ class TDrainPumpUnitServiceImplTest {
             }
             return 1;
         });
+        // 台账/可登记机组：可登记口子的子查询里带 status = 0，按此只留在用站名下机组
+        when(unitMapper.selectList(any())).thenAnswer(inv -> {
+            QueryWrapper<TDrainPumpUnit> w = inv.getArgument(0);
+            String seg = w.getSqlSegment();
+            Map<String, List<Occ>> p = parse(seg, w.getParamNameValuePairs());
+            String siteNo = strEq(p, "site_no");
+            boolean inUseOnly = seg.contains("status = 0");
+            return units.values().stream()
+                    .filter(u -> !Integer.valueOf(1).equals(u.getDelFlag()))
+                    .filter(u -> siteNo == null || siteNo.equals(u.getSiteNo()))
+                    .filter(u -> !inUseOnly || stationInUseByNo(u.getSiteNo()))
+                    .collect(Collectors.toList());
+        });
 
         ITDrainSiteTypeService typeService = mock(ITDrainSiteTypeService.class);
         when(typeService.requireLeafEnabled(any())).thenAnswer(inv -> {
@@ -127,6 +140,18 @@ class TDrainPumpUnitServiceImplTest {
     }
 
     private ITDrainSiteTypeService typeService;
+
+    private boolean stationInUseByNo(String siteNo) {
+        if (siteNo == null) {
+            return false;
+        }
+        return stations.values().stream()
+                .filter(s -> siteNo.equals(s.getSiteNo()))
+                .findFirst()
+                .map(s -> (s.getStatus() == null || s.getStatus() == 0)
+                        && !Integer.valueOf(1).equals(s.getDelFlag()))
+                .orElse(false);
+    }
 
     private TDrainStation station(long id, String siteNo, int status, String road) {
         TDrainStation s = new TDrainStation();
@@ -260,6 +285,23 @@ class TDrainPumpUnitServiceImplTest {
         TDrainPumpUnit u = stored(2011L, "1#", 1L, "PS01", "PS01-EM-01");
         ReflectionTestUtils.setField(service, "drainAreaScope", fixedScope("城东片区"));
         assertNull(service.selectTDrainPumpUnitById(u.getId()), "旁片区机组权限层查不到");
+    }
+
+    @Test
+    void registrableList_excludesUnitsUnderDisabledStation() {
+        station(0L, "PS00", 0, "城东片区");
+        station(1L, "PS01", 1, "城西片区");
+        stored(2001L, "1#", 0L, "PS00", "PS00-EM-01");
+        TDrainPumpUnit deadStationUnit = stored(2011L, "1#", 1L, "PS01", "PS01-EM-01");
+        deadStationUnit.setDelFlag(0);
+
+        List<TDrainPumpUnit> registrable =
+                service.selectRegistrableUnitList(new QueryWrapper<>());
+
+        assertEquals(1, registrable.size(), "停用站名下机组不进可登记集");
+        assertEquals("PS00", registrable.get(0).getSiteNo());
+        assertTrue(registrable.stream().noneMatch(u -> "PS01".equals(u.getSiteNo())),
+                "停用站 PS01 一台都不许被登记选上");
     }
 
     @Test

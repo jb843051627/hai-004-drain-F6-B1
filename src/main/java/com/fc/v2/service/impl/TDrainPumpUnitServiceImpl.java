@@ -72,6 +72,17 @@ public class TDrainPumpUnitServiceImpl implements ITDrainPumpUnitService {
     }
 
     @Override
+    public List<TDrainPumpUnit> selectRegistrableUnitList(Wrapper<TDrainPumpUnit> queryWrapper) {
+        QueryWrapper<TDrainPumpUnit> wrapper = queryWrapper instanceof QueryWrapper
+                ? (QueryWrapper<TDrainPumpUnit>) queryWrapper
+                : new QueryWrapper<TDrainPumpUnit>();
+        wrapper.eq("del_flag", 0);
+        // 只摆在 用泵站名下机组：走「在用站」版片区子查询，站一停用，名下机组立刻选不上
+        DrainAreaScope.restrictByInUseStationRoads(wrapper, "site_no", drainAreaScope.roadNamesOrNull());
+        return this.drainPumpUnitMapper.selectList(wrapper);
+    }
+
+    @Override
     public int insertTDrainPumpUnit(TDrainPumpUnit unit) {
         validate(unit);
         TDrainStation station = this.drainStationMapper.selectById(unit.getSiteId());

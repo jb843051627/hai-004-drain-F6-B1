@@ -167,7 +167,28 @@ public class DrainAreaScope {
     public static <T> void restrictByStationRoads(
             com.baomidou.mybatisplus.core.conditions.query.QueryWrapper<T> wrapper,
             String siteNoColumn, List<String> roads) {
+        restrictByStationRoads(wrapper, siteNoColumn, roads, false);
+    }
+
+    /**
+     * 同 {@link #restrictByStationRoads}，但只认在用（status=0）泵站名下：登记选机组这类
+     * 「停用站不许再被选上」的口子用这把——已停用泵站名下的机组一条都不进可选集。
+     */
+    public static <T> void restrictByInUseStationRoads(
+            com.baomidou.mybatisplus.core.conditions.query.QueryWrapper<T> wrapper,
+            String siteNoColumn, List<String> roads) {
+        restrictByStationRoads(wrapper, siteNoColumn, roads, true);
+    }
+
+    private static <T> void restrictByStationRoads(
+            com.baomidou.mybatisplus.core.conditions.query.QueryWrapper<T> wrapper,
+            String siteNoColumn, List<String> roads, boolean inUseOnly) {
         if (roads == null) {
+            // 全片可见（系统/admin）也要按「在用」收口时，补一条不绑片区的子查询
+            if (inUseOnly) {
+                wrapper.apply(siteNoColumn + " IN (SELECT site_no FROM t_drain_station "
+                        + "WHERE del_flag = 0 AND status = 0)");
+            }
             return;
         }
         if (roads.isEmpty()) {
@@ -181,8 +202,9 @@ public class DrainAreaScope {
             }
             placeholders.append("{").append(i).append("}");
         }
+        String statusCond = inUseOnly ? " AND status = 0" : "";
         wrapper.apply(siteNoColumn + " IN (SELECT site_no FROM t_drain_station "
-                + "WHERE del_flag = 0 AND road_name IN (" + placeholders + "))",
+                + "WHERE del_flag = 0" + statusCond + " AND road_name IN (" + placeholders + "))",
                 roads.toArray());
     }
 }
