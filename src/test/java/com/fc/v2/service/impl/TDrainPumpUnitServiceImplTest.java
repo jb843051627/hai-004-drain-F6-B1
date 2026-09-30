@@ -83,6 +83,23 @@ class TDrainPumpUnitServiceImplTest {
                     .filter(u -> neId == null || !neId.equals(u.getId()))
                     .count();
         });
+        // 可登记机组清单：未删机组，且所属站在册未删在用；子查询片段（site_no IN (SELECT ...)）
+        // 照片段里出现的 status/road_name 条件过滤，片区授权照 roadNamesOrNull 钉
+        when(unitMapper.selectList(any())).thenAnswer(inv -> {
+            QueryWrapper<TDrainPumpUnit> w = inv.getArgument(0);
+            String seg = w.getSqlSegment();
+            boolean enabledOnly = seg.contains("status = 0");
+            List<String> roadFilter = subqueryRoads(seg, w.getParamNameValuePairs());
+            return units.values().stream()
+                    .filter(u -> !Integer.valueOf(1).equals(u.getDelFlag()))
+                    .filter(u -> !enabledOnly || stations.values().stream()
+                            .anyMatch(s -> s.getSiteNo() != null && s.getSiteNo().equals(u.getSiteNo())
+                                    && !Integer.valueOf(1).equals(s.getDelFlag())
+                                    && Integer.valueOf(0).equals(s.getStatus())
+                                    && (roadFilter == null
+                                        || (s.getRoadName() != null && roadFilter.contains(s.getRoadName())))))
+                    .collect(Collectors.toList());
+        });
         when(unitMapper.insert(any())).thenAnswer(inv -> {
             TDrainPumpUnit u = inv.getArgument(0);
             if (u.getId() == null) {
@@ -286,7 +303,46 @@ class TDrainPumpUnitServiceImplTest {
         };
     }
 
+    // ---- 可登记机组：停用站名下机组不进清单，片区再裁一道 ----
+
+    @Test
+    void registerable_excludesDisabledStationUnits() {
+        station(0L, "PS00", 0, "城东片区");   // 在用
+        station(1L, "PS01", 1, "城西片区");   // 停用
+        TDrainPumpUnit u0 = stored(2001L, "1#", 0L, "PS00", "PS00-EM-01");
+        stored(2011L, "1#", 1L, "PS01", "PS01-EM-01"); // 停用站名下机组
+
+        List<TDrainPumpUnit> pick = service.selectRegisterableUnits();
+        assertEquals(1, pick.size(), "停用站名下机组不许被登记选上");
+        assertEquals(u0.getId(), pick.get(0).getId());
+    }
+
+    @Test
+    void registerable_respectsAreaScope() {
+        station(0L, "PS00", 0, "城东片区");
+        station(1L, "PS01", 0, "城西片区");
+        stored(2001L, "1#", 0L, "PS00", "PS00-EM-01");
+        stored(2011L, "1#", 1L, "PS01", "PS01-EM-01");
+
+        ReflectionTestUtils.setField(service, "drainAreaScope", fixedScope("城东片区"));
+        List<TDrainPumpUnit> pick = service.selectRegisterableUnits();
+        assertEquals(1, pick.size(), "片区人只选得到本片区在用站机组");
+        assertEquals("PS00", pick.get(0).getSiteNo());
+    }
+
     // ---- QueryWrapper 参数抠取 ----
+
+    /** 抠子查询里绑定的片区名：可登记清单唯一的字符串绑定参数就是片区名；无绑定返回 null（不限片）。 */
+    private static List<String> subqueryRoads(String seg, Map<String, Object> params) {
+        if (seg.contains("1 = 0") || seg.contains("1=0")) {
+            return new ArrayList<>();
+        }
+        List<String> roads = params.values().stream()
+                .filter(v -> v instanceof String)
+                .map(Object::toString)
+                .collect(Collectors.toList());
+        return roads.isEmpty() ? null : roads;
+    }
 
     private static Map<String, List<Occ>> parse(String seg, Map<String, Object> params) {
         Map<String, List<Occ>> out = new LinkedHashMap<>();

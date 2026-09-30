@@ -16,6 +16,12 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -40,7 +46,9 @@ import com.fc.v2.model.auto.TDrainStation;
 /**
  * 机组运行记录单登记红线测试（内存库模拟表）：
  * 单号人手填、一机组一年一单、停用站不收、时长负/零/数量级离谱当场退回、
- * 电耗费与评定档系统算出（表单值被覆盖）、台账三态都摆、片区 where 裁片。
+ * 电耗费与评定档系统算出（表单值被覆盖）、台账三态都摆、片区 where 裁片；
+ * 另覆盖：创建人只认当前登录人、评定档上限含本档、并发同号/同机组同年只一成、
+ * 编辑不改号放行/改号校重号、编辑重算费档并署更新人。
  *
  * @author fuce
  * @date 2026-09-29
@@ -48,11 +56,15 @@ import com.fc.v2.model.auto.TDrainStation;
 class TDrainRunRecordServiceImplTest {
 
     private TDrainRunRecordServiceImpl service;
-    private final Map<Long, TDrainRunRecord> records = new LinkedHashMap<>();
-    private final Map<Long, TDrainStation> stations = new LinkedHashMap<>();
-    private final Map<Long, TDrainPumpUnit> units = new LinkedHashMap<>();
+    // 并发用例要两线程同时打进来，内存表用并发 map，临界区锁保证同键两笔串行
+    private final Map<Long, TDrainRunRecord> records = new ConcurrentHashMap<>();
+    private final Map<Long, TDrainStation> stations = new ConcurrentHashMap<>();
+    private final Map<Long, TDrainPumpUnit> units = new ConcurrentHashMap<>();
     private final AtomicLong seq = new AtomicLong(5000);
     private final BigDecimal price = new BigDecimal("0.80");
+
+    /** 单测里的当前登录人，可随时换，验"谁提交署谁名" */
+    private String currentUser = "duty_li";
 
     @BeforeEach
     void setUp() {
@@ -60,6 +72,7 @@ class TDrainRunRecordServiceImplTest {
         stations.clear();
         units.clear();
         seq.set(5000);
+        currentUser = "duty_li";
 
         TDrainRunRecordMapper recordMapper = mock(TDrainRunRecordMapper.class);
         TDrainStationMapper stationMapper = mock(TDrainStationMapper.class);
@@ -75,6 +88,8 @@ class TDrainRunRecordServiceImplTest {
         });
         when(unitMapper.selectById(any())).thenAnswer(inv -> units.get(((Number) inv.getArgument(0)).longValue()));
 
+        when(recordMapper.selectById(any())).thenAnswer(inv -> records.get(((Number) inv.getArgument(0)).longValue()));
+
         when(recordMapper.selectOne(any())).thenAnswer(inv -> {
             QueryWrapper<TDrainRunRecord> w = inv.getArgument(0);
             Map<String, List<Occ>> p = parse(w.getSqlSegment(), w.getParamNameValuePairs());
@@ -89,11 +104,13 @@ class TDrainRunRecordServiceImplTest {
             String billNo = strEq(p, "bill_no");
             Long unitId = eqLong(p, "unit_id");
             Integer runYear = intEq(p, "run_year");
+            Long neId = neLong(p, "id");
             return (int) records.values().stream()
                     .filter(r -> !Integer.valueOf(1).equals(r.getDelFlag()))
                     .filter(r -> billNo == null || billNo.equals(r.getBillNo()))
                     .filter(r -> unitId == null || unitId.equals(r.getUnitId()))
                     .filter(r -> runYear == null || runYear.equals(r.getRunYear()))
+                    .filter(r -> neId == null || !neId.equals(r.getId()))
                     .count();
         });
 
@@ -121,13 +138,29 @@ class TDrainRunRecordServiceImplTest {
             return 1;
         });
 
+        // 新编辑口走 updateById：传的是载出后改完的完整单，整单放回内存表
+        when(recordMapper.updateById(any())).thenAnswer(inv -> {
+            TDrainRunRecord r = inv.getArgument(0);
+            if (r.getId() == null || !records.containsKey(r.getId())) {
+                return 0;
+            }
+            records.put(r.getId(), r);
+            return 1;
+        });
+
         when(recordMapper.update(any(), any(UpdateWrapper.class))).thenAnswer(inv -> {
             TDrainRunRecord r = inv.getArgument(0);
             records.put(r.getId(), r);
             return 1;
         });
 
-        service = new TDrainRunRecordServiceImpl();
+        service = new TDrainRunRecordServiceImpl() {
+            // 不依赖 Shiro 容器：当前登录人由测试给定
+            @Override
+            protected String currentLoginName() {
+                return currentUser;
+            }
+        };
         ReflectionTestUtils.setField(service, "baseMapper", recordMapper);
         ReflectionTestUtils.setField(service, "drainStationMapper", stationMapper);
         ReflectionTestUtils.setField(service, "drainPumpUnitMapper", unitMapper);
@@ -147,6 +180,15 @@ class TDrainRunRecordServiceImplTest {
         s.setTh3Max(new BigDecimal("10"));
         s.setDelFlag(0);
         stations.put(id, s);
+        return s;
+    }
+
+    /** 自定义三档阈值的站，专测压线口径 */
+    private TDrainStation stationThresholds(long id, String th1, String th2, String th3) {
+        TDrainStation s = station(id, "PS" + id, 0, "城东片区");
+        s.setTh1Max(th1 == null ? null : new BigDecimal(th1));
+        s.setTh2Max(th2 == null ? null : new BigDecimal(th2));
+        s.setTh3Max(th3 == null ? null : new BigDecimal(th3));
         return s;
     }
 
@@ -204,7 +246,7 @@ class TDrainRunRecordServiceImplTest {
         TDrainRunRecord saved = service.registerTDrainRunRecord(r, price);
 
         assertEquals(new BigDecimal("1.60"), saved.getFineAmt(), "2h × 0.80 = 1.60，系统说了算");
-        assertEquals(2, saved.getGradeLevel().intValue(), "2 落在二档，系统折档，人手值被覆盖");
+        assertEquals(2, saved.getGradeLevel().intValue(), "2 在(一档上限1, 二档上限5]落二档，人手值被覆盖");
     }
 
     // 3. 单号人手填：空号退回
@@ -325,6 +367,287 @@ class TDrainRunRecordServiceImplTest {
         assertEquals(3, service.selectTDrainRunRecordList(new QueryWrapper<>()).size());
     }
 
+    // 12. 创建人只认当前登录人：表单夹带的占位名「片区运行员」必须被盖掉
+    @Test
+    void register_creatorIsCurrentLogin_formCarrierOverwritten() {
+        station(0L, "PS00", 0, "城东片区");
+        unit(2001L, "1#", 0L, "PS00");
+        currentUser = "duty_li";
+        TDrainRunRecord r = form("YX-WHO", 2001L, "0.5");
+        r.setCreateBy("片区运行员"); // 页面占位/上一人名字，绝不能落库
+        r.setUpdateBy("片区运行员");
+
+        TDrainRunRecord saved = service.registerTDrainRunRecord(r, price);
+
+        assertEquals("duty_li", saved.getCreateBy(), "谁提交署谁名，占位名被登录人覆盖");
+        assertNull(saved.getUpdateBy(), "新登记没有更新者，表单夹带的一并清掉");
+    }
+
+    // 13. 换个人提交，落的就是另一个人的名（不跟账号串）
+    @Test
+    void register_creatorFollowsLoginSwitch() {
+        station(0L, "PS00", 0, "城东片区");
+        unit(2001L, "1#", 0L, "PS00");
+        unit(2002L, "2#", 0L, "PS00");
+        currentUser = "duty_li";
+        TDrainRunRecord a = register("YX-A", 2001L, "0.5");
+        currentUser = "duty_wang";
+        TDrainRunRecord b = register("YX-B", 2002L, "0.5");
+        assertEquals("duty_li", a.getCreateBy());
+        assertEquals("duty_wang", b.getCreateBy(), "换人登录，署名跟着换，不钉死在一个名字上");
+    }
+
+    // 14. 评定档「上限含本档」：恰好敲在上限不掉档；高出才掉下一档
+    @Test
+    void register_grade_upperBoundInclusive() {
+        // 阈值 1/5/10
+        stationThresholds(0L, "1", "5", "10");
+        unit(2001L, "1#", 0L, "PS0");
+
+        assertEquals(1, register("YX-G1", 2001L, "1").getGradeLevel(),
+                "恰好等于一档上限1，仍归一档，不许掉成二档");
+        units.clear();
+        unit(2002L, "2#", 0L, "PS0");
+        assertEquals(2, register("YX-G2", 2002L, "5").getGradeLevel(),
+                "恰好等于二档上限5，仍归二档");
+        units.clear();
+        unit(2003L, "3#", 0L, "PS0");
+        assertEquals(3, register("YX-G3", 2003L, "10").getGradeLevel(),
+                "恰好等于三档上限10，仍归三档");
+        // 临界点两侧必须差开：1.00 在一档，1.01 就进二档
+        units.clear();
+        unit(2004L, "4#", 0L, "PS0");
+        assertEquals(2, register("YX-G4", 2004L, "1.01").getGradeLevel());
+        units.clear();
+        unit(2005L, "5#", 0L, "PS0");
+        assertEquals(4, register("YX-G5", 2005L, "10.01").getGradeLevel(), "高出三档上限归四档");
+    }
+
+    // 15. 并发：同一单号两个请求同时登记，只许一张落库
+    @Test
+    void register_concurrentSameBillNo_onlyOneWins() throws Exception {
+        station(0L, "PS00", 0, "城东片区");
+        // 每轮换一台新机组，避免「一机组一年一单」干扰，单看同号这道闸
+        for (int round = 0; round < 20; round++) {
+            unit(2100L + round, (round + 10) + "#", 0L, "PS00");
+            String billNo = "YX-CON-" + round;
+            ConcurrentOutcome oc = runConcurrentRegister(billNo, 2100L + round, billNo, 2100L + round);
+            assertEquals(1, oc.success.get(), "第" + round + "轮：同号并发只许一成");
+            assertEquals(1, oc.rejected.get(), "第" + round + "轮：后到那笔必须被重号闸挡下");
+        }
+        assertEquals(20, records.size(), "每轮只落一张，库里不许出同号重单");
+    }
+
+    // 16. 并发：不同单号、但同机组同年，也只许一张落库（一机组一年一单）
+    @Test
+    void register_concurrentSameUnitYear_onlyOneWins() throws Exception {
+        station(0L, "PS00", 0, "城东片区");
+        // 每轮换新机组：两笔不同号同打一台，只有一张进得来
+        for (int round = 0; round < 20; round++) {
+            long uid = 2200L + round;
+            unit(uid, (round + 20) + "#", 0L, "PS00");
+            ConcurrentOutcome oc = runConcurrentRegister(
+                    "YX-Y-A-" + round, uid, "YX-Y-B-" + round, uid);
+            assertEquals(1, oc.success.get(), "第" + round + "轮：同机组同年并发只许一成");
+            assertEquals(1, oc.rejected.get(), "第" + round + "轮：另一笔被一机组一年一单挡下");
+        }
+        assertEquals(20, records.size());
+    }
+
+    private ConcurrentOutcome runConcurrentRegister(String billA, long unitA,
+                                                    String billB, long unitB) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger success = new AtomicInteger();
+        AtomicInteger rejected = new AtomicInteger();
+        List<Future<?>> futures = new ArrayList<>();
+        for (String bill : Arrays.asList(billA, billB)) {
+            futures.add(pool.submit(() -> {
+                try {
+                    start.await();
+                    service.registerTDrainRunRecord(form(bill, unitA, "0.5"), price);
+                    success.incrementAndGet();
+                } catch (DrainArchiveException e) {
+                    rejected.incrementAndGet();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+                return null;
+            }));
+        }
+        start.countDown();
+        for (Future<?> f : futures) {
+            f.get();
+        }
+        pool.shutdown();
+        return new ConcurrentOutcome(success, rejected);
+    }
+
+    private static class ConcurrentOutcome {
+        final AtomicInteger success;
+        final AtomicInteger rejected;
+
+        ConcurrentOutcome(AtomicInteger success, AtomicInteger rejected) {
+            this.success = success;
+            this.rejected = rejected;
+        }
+    }
+
+    // ---- 编辑口径 ----
+
+    // 17. 编辑老单、单号压根没动：保存必须放行，不许自己撞自己
+    @Test
+    void edit_billNoUnchanged_saved() {
+        station(0L, "PS00", 0, "城东片区");
+        unit(2001L, "1#", 0L, "PS00");
+        TDrainRunRecord saved = register("YX-EDIT", 2001L, "0.5");
+
+        TDrainRunRecord patch = new TDrainRunRecord();
+        patch.setId(saved.getId());
+        patch.setBillNo("YX-EDIT"); // 单号原样回显，没动
+        patch.setRemark("补一句备注");
+        int rows = service.updateTDrainRunRecord(patch);
+
+        assertEquals(1, rows, "单号没动不该被重号闸拦，保存要成");
+        TDrainRunRecord after = records.get(saved.getId());
+        assertEquals("YX-EDIT", after.getBillNo());
+        assertEquals("补一句备注", after.getRemark());
+    }
+
+    // 18. 编辑时单号字段干脆不带（null）：同样放行
+    @Test
+    void edit_billNoOmitted_saved() {
+        station(0L, "PS00", 0, "城东片区");
+        unit(2001L, "1#", 0L, "PS00");
+        TDrainRunRecord saved = register("YX-EDIT2", 2001L, "0.5");
+
+        TDrainRunRecord patch = new TDrainRunRecord();
+        patch.setId(saved.getId());
+        patch.setRemark("只改备注");
+        assertEquals(1, service.updateTDrainRunRecord(patch));
+        assertEquals("YX-EDIT2", records.get(saved.getId()).getBillNo(), "没带单号就维持原号");
+    }
+
+    // 19. 编辑时把手改单号改成已存在的号：必须拦下对档案
+    @Test
+    void edit_changeBillNo_duplicate_rejected() {
+        station(0L, "PS00", 0, "城东片区");
+        unit(2001L, "1#", 0L, "PS00");
+        unit(2002L, "2#", 0L, "PS00");
+        TDrainRunRecord a = register("YX-KEEP", 2001L, "0.5");
+        register("YX-USED", 2002L, "0.5");
+
+        TDrainRunRecord patch = new TDrainRunRecord();
+        patch.setId(a.getId());
+        patch.setBillNo("YX-USED"); // 手改成别人已用的号
+        assertThrows(DrainArchiveException.class, () -> service.updateTDrainRunRecord(patch),
+                "手改单号撞已有号，必须拦下");
+        assertEquals("YX-KEEP", records.get(a.getId()).getBillNo(), "撞号保存不上，原号不动");
+    }
+
+    // 20. 编辑改成一个没人用的新号：放行
+    @Test
+    void edit_changeBillNo_fresh_saved() {
+        station(0L, "PS00", 0, "城东片区");
+        unit(2001L, "1#", 0L, "PS00");
+        TDrainRunRecord saved = register("YX-OLDNO", 2001L, "0.5");
+
+        TDrainRunRecord patch = new TDrainRunRecord();
+        patch.setId(saved.getId());
+        patch.setBillNo("YX-NEWNO");
+        assertEquals(1, service.updateTDrainRunRecord(patch));
+        assertEquals("YX-NEWNO", records.get(saved.getId()).getBillNo());
+    }
+
+    // 21. 编辑改时长：重校红线，费与档由系统照档案重算（上限含本档），更新者署当前登录人
+    @Test
+    void edit_qtyChanged_recalculatedAndStamped() {
+        stationThresholds(0L, "1", "5", "10");
+        unit(2001L, "1#", 0L, "PS0");
+        currentUser = "duty_li";
+        TDrainRunRecord saved = register("YX-RC", 2001L, "2");
+        assertEquals(new BigDecimal("1.60"), saved.getFineAmt());
+
+        currentUser = "duty_wang"; // 换个人来订正
+        TDrainRunRecord patch = new TDrainRunRecord();
+        patch.setId(saved.getId());
+        patch.setQty(new BigDecimal("5")); // 压二档上限
+        assertEquals(1, service.updateTDrainRunRecord(patch));
+
+        TDrainRunRecord after = records.get(saved.getId());
+        assertEquals(new BigDecimal("4.00"), after.getFineAmt(), "5 × 0.80 = 4.00，系统重算");
+        assertEquals(2, after.getGradeLevel().intValue(), "压二档上限5仍归二档");
+        assertEquals("duty_wang", after.getUpdateBy(), "谁改署谁名");
+        assertNotNull(after.getUpdateTime());
+        assertEquals("duty_li", after.getCreateBy(), "创建人不被编辑改写");
+    }
+
+    // 22. 编辑不存在/已删的单：返回 0，不凭空造
+    @Test
+    void edit_missing_returnsZero() {
+        TDrainRunRecord patch = new TDrainRunRecord();
+        patch.setId(999L);
+        patch.setBillNo("YX-X");
+        assertEquals(0, service.updateTDrainRunRecord(patch));
+    }
+
+    // 23. 编辑带非法时长（零/负）：照样退回
+    @Test
+    void edit_badQty_rejected() {
+        station(0L, "PS00", 0, "城东片区");
+        unit(2001L, "1#", 0L, "PS00");
+        TDrainRunRecord saved = register("YX-BQ", 2001L, "0.5");
+        TDrainRunRecord patch = new TDrainRunRecord();
+        patch.setId(saved.getId());
+        patch.setQty(BigDecimal.ZERO);
+        assertThrows(DrainArchiveException.class, () -> service.updateTDrainRunRecord(patch));
+    }
+
+    // 24. 并发：两张不同老单同时改号成同一个新号，只许一张改成功（查重+落库同一锁）
+    @Test
+    void edit_concurrentChangeToSameBillNo_onlyOneWins() throws Exception {
+        station(0L, "PS00", 0, "城东片区");
+        unit(2001L, "1#", 0L, "PS00");
+        unit(2002L, "2#", 0L, "PS00");
+        long idA = register("YX-EA", 2001L, "0.5").getId();
+        long idB = register("YX-EB", 2002L, "0.5").getId();
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger success = new AtomicInteger();
+        AtomicInteger rejected = new AtomicInteger();
+        List<Future<?>> futures = new ArrayList<>();
+        for (long id : Arrays.asList(idA, idB)) {
+            futures.add(pool.submit(() -> {
+                try {
+                    start.await();
+                    TDrainRunRecord patch = new TDrainRunRecord();
+                    patch.setId(id);
+                    patch.setBillNo("YX-SAME"); // 两笔都改成同一个号
+                    if (service.updateTDrainRunRecord(patch) > 0) {
+                        success.incrementAndGet();
+                    }
+                } catch (DrainArchiveException e) {
+                    rejected.incrementAndGet();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+                return null;
+            }));
+        }
+        start.countDown();
+        for (Future<?> f : futures) {
+            f.get();
+        }
+        pool.shutdown();
+
+        assertEquals(1, success.get(), "同一个新号并发改，只许一成");
+        assertEquals(1, rejected.get(), "另一笔撞号必须退回");
+        long onSameNo = records.values().stream()
+                .filter(r -> "YX-SAME".equals(r.getBillNo())).count();
+        assertEquals(1, onSameNo, "库里最终只能有一张挂着这个号");
+    }
+
     // ---- 参数抠取小工具（QueryWrapper 参数按 "?" 全局先后次序绑定） ----
 
     private static Map<String, List<Occ>> parse(String seg, Map<String, Object> params) {
@@ -366,6 +689,11 @@ class TDrainRunRecordServiceImplTest {
 
     private static Long eqLong(Map<String, List<Occ>> p, String column) {
         Object v = first(p, column, "=");
+        return v instanceof Number ? ((Number) v).longValue() : null;
+    }
+
+    private static Long neLong(Map<String, List<Occ>> p, String column) {
+        Object v = first(p, column, "<>");
         return v instanceof Number ? ((Number) v).longValue() : null;
     }
 

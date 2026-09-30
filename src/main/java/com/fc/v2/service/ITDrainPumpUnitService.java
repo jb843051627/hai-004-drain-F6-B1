@@ -22,6 +22,13 @@ public interface ITDrainPumpUnitService {
     /** 新增机组 */
     int insertTDrainPumpUnit(TDrainPumpUnit unit);
 
+    /**
+     * 运行登记可选用的机组：只摆未删、且所属泵站在册未删且在用（0）的机组，
+     * 再按当前登录人片区裁剪。停用站名下机组不进清单——登记页选机组只准从这里取，
+     * 服务层登记时另有停用拦截兜底。
+     */
+    List<TDrainPumpUnit> selectRegisterableUnits();
+
     /** 编辑机组 */
     int updateTDrainPumpUnit(TDrainPumpUnit unit);
 }

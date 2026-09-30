@@ -23,7 +23,8 @@ import org.springframework.web.bind.annotation.ResponseBody;
  *
  * 页面不替登记下结论：单号人手填，校验全在服务层办；
  * 电耗费与评定档由系统照档案算，页面提交不带这两列、也不预判，登记以返回为准。
- * 不开编辑、删除的口子——老单原样留存。
+ * 老单不删除：留「编辑」口子给单号/备注订正与时长重录，身份锚点（机组/站/年度）不许挪，
+ * 单号没改不重校、手改了才对重号；停用站只挡新开、不挡名下老单订正。
  *
  * @author fuce
  * @date 2026-09-12
@@ -85,5 +86,18 @@ public class DrainRunRecordController extends BaseController {
         TDrainRunRecord saved = drainRunRecordService.registerTDrainRunRecord(
                 record, v2Config.getDrainPowerPrice());
         return AjaxResult.success(200, "登记成功，电耗费与评定档以系统核算为准", saved);
+    }
+
+    @Log(title = "机组运行记录单编辑", action = "edit")
+    @ApiOperation(value = "编辑", notes = "老单订正口：单号没改不重校、手改了才对重号；时长带了重校并由系统重算费与档；"
+            + "机组/站/年度/状态不许从表单挪；更新者署当前登录人")
+    @PostMapping("/edit")
+    @RequiresPermissions("drain:drainRunRecord:add")
+    @ResponseBody
+    public AjaxResult edit(TDrainRunRecord record) {
+        int rows = drainRunRecordService.updateTDrainRunRecord(record);
+        return rows > 0
+                ? AjaxResult.success(200, "保存成功，电耗费与评定档以系统核算为准", null)
+                : AjaxResult.error("单据不存在或已删除，保存不上");
     }
 }

@@ -76,6 +76,15 @@ public class DrainPumpUnitController extends BaseController {
         return AjaxResult.successData(200, unit);
     }
 
+    @Log(title = "可登记机组清单", action = "registerable")
+    @ApiOperation(value = "运行登记可选机组", notes = "只摆未删且所属泵站在册在用的机组，停用站名下机组不进清单；片区权限服务层裁")
+    @GetMapping("/registerable")
+    @RequiresPermissions("drain:drainRunRecord:add")
+    @ResponseBody
+    public AjaxResult registerable() {
+        return AjaxResult.successData(200, drainPumpUnitService.selectRegisterableUnits());
+    }
+
     @Log(title = "泵站机组新增", action = "add")
     @ApiOperation(value = "新增机组", notes = "挂在册泵站；计量点编码全局唯一；类别只许挂末级在用；站号系统回填")
     @PostMapping("/add")

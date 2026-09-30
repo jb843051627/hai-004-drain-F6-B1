@@ -161,6 +161,35 @@ public class DrainAreaScope {
     }
 
     /**
+     * 供登记/派单选用：本表只挂泵站编号，且只许选「在册未删且在用」的站名下条目。
+     * 停用站档案不删（老单照留），但它名下机组/条目不许再被新单选上——状态在这一层
+     * 钉进子查询，不是把下拉摆全了再靠页面藏。片区裁剪同 {@link #restrictByStationRoads}。
+     */
+    public static <T> void restrictByEnabledStationRoads(
+            com.baomidou.mybatisplus.core.conditions.query.QueryWrapper<T> wrapper,
+            String siteNoColumn, List<String> roads) {
+        if (roads == null) {
+            wrapper.apply(siteNoColumn + " IN (SELECT site_no FROM t_drain_station "
+                    + "WHERE del_flag = 0 AND status = 0)");
+            return;
+        }
+        if (roads.isEmpty()) {
+            wrapper.apply("1 = 0");
+            return;
+        }
+        StringBuilder placeholders = new StringBuilder();
+        for (int i = 0; i < roads.size(); i++) {
+            if (i > 0) {
+                placeholders.append(",");
+            }
+            placeholders.append("{").append(i).append("}");
+        }
+        wrapper.apply(siteNoColumn + " IN (SELECT site_no FROM t_drain_station "
+                + "WHERE del_flag = 0 AND status = 0 AND road_name IN (" + placeholders + "))",
+                roads.toArray());
+    }
+
+    /**
      * 本表只挂着泵站编号（机组/运行单）：走泵站档案子查询裁片区，片区列不在本表也照样钉死。
      * 参数用 {n} 占位绑定，不拼字符串值，避免片区名里带引号把条件撑破。
      */

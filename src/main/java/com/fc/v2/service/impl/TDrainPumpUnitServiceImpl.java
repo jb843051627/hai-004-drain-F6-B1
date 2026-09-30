@@ -72,6 +72,17 @@ public class TDrainPumpUnitServiceImpl implements ITDrainPumpUnitService {
     }
 
     @Override
+    public List<TDrainPumpUnit> selectRegisterableUnits() {
+        QueryWrapper<TDrainPumpUnit> wrapper = new QueryWrapper<>();
+        wrapper.eq("del_flag", 0);
+        // 只准选在册未删且在用站名下的机组：停用站不删档，但它名下机组不许再被运行登记选上；
+        // 片区一并在子查询里裁，旁片区机组也进不来
+        DrainAreaScope.restrictByEnabledStationRoads(wrapper, "site_no", drainAreaScope.roadNamesOrNull());
+        wrapper.orderByAsc("site_no", "unit_no", "id");
+        return this.drainPumpUnitMapper.selectList(wrapper);
+    }
+
+    @Override
     public int insertTDrainPumpUnit(TDrainPumpUnit unit) {
         validate(unit);
         TDrainStation station = this.drainStationMapper.selectById(unit.getSiteId());
